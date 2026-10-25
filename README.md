@@ -122,6 +122,13 @@ This tells CWA to avoid enabling WAL on the Calibre `metadata.db` and the `app.d
 - Ingest runs one book at a time, so the hook never overlaps with another import. Keep it short: it is stopped after `CWA_POST_IMPORT_HOOK_TIMEOUT` seconds (default `300`).
 - A failing or missing hook is logged and never aborts the import.
 
+### Folder-as-book ingest
+
+- Set `CWA_INGEST_FOLDER_AS_BOOK=true` to treat all files in one subfolder of the ingest folder as formats of the same book, e.g. `ingest/Vargas - Die schwarzen Wasser/` with an EPUB, a MOBI and a PDF.
+- CWA waits until the folder stops changing (`CWA_INGEST_FOLDER_SETTLE_SECONDS`, default `5`), imports the best file as the book (the target format first, then EPUB, KEPUB, AZW3, MOBI, …) and attaches every other file to that book id. Matching does not depend on title or author, so a post-import hook that renames the book does not create duplicates.
+- Formats the book already has are skipped. Files that arrive later in the same folder are still attached; the folder-to-book mapping is kept in `/config/cwa_ingest_folder_books.json` until the folder is gone or `CWA_INGEST_FOLDER_BOOK_TTL_HOURS` (default `24`) have passed.
+- Files directly in the ingest folder are still imported as single books. A first-level folder named after a CWA user stays an auto-send routing folder; put book folders inside it (`ingest/<user>/<book>/`).
+
 ### Running behind multiple proxies (Cloudflare Tunnel, reverse proxy)
 
 - CWA uses Werkzeug's ProxyFix middleware to properly handle `X-Forwarded-For`, `X-Forwarded-Proto`, and other proxy headers.

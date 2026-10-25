@@ -432,6 +432,142 @@ def mark_ingest_batch_dirty() -> None:
         print(f"[ingest-processor] WARN: Failed to mark ingest batch follow-up dirty: {e}", flush=True)
 
 
+# ── Folder-as-book ingest ──────────────────────────────────────────────────
+# With CWA_INGEST_FOLDER_AS_BOOK enabled, all files in one subfolder of the ingest
+# folder are formats of the same book: the best file is imported as the book, every
+# other file is attached to that book id with add_format (no title/author matching).
+# The folder -> book id mapping lives in a small JSON file so files that arrive later
+# still find their book.
+
+FOLDER_MAIN_FORMAT_PRIORITY = ('epub', 'kepub', 'azw3', 'mobi', 'azw', 'fb2', 'fbz', 'docx', 'odt', 'pdf')
+
+
+def is_folder_as_book_enabled() -> bool:
+    return os.environ.get("CWA_INGEST_FOLDER_AS_BOOK", "false").strip().lower() in ("1", "true", "yes", "on")
+
+
+def get_folder_books_file() -> str:
+    return os.environ.get("CWA_INGEST_FOLDER_BOOKS_FILE", "/config/cwa_ingest_folder_books.json")
+
+
+def _folder_books_ttl_seconds() -> int:
+    try:
+        return int(float(os.environ.get("CWA_INGEST_FOLDER_BOOK_TTL_HOURS", "24")) * 3600)
+    except ValueError:
+        return 24 * 3600
+
+
+def _load_folder_books() -> dict:
+    """Folder -> book id mapping, without entries whose folder is gone or that expired."""
+    try:
+        with open(get_folder_books_file(), "r", encoding="utf-8") as f:
+            entries = json.load(f)
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(entries, dict):
+        return {}
+    cutoff = time.time() - _folder_books_ttl_seconds()
+    return {
+        folder: entry for folder, entry in entries.items()
+        if isinstance(entry, dict) and os.path.isdir(folder) and entry.get("updated", 0) >= cutoff
+    }
+
+
+def _save_folder_books(entries: dict) -> None:
+    path = get_folder_books_file()
+    try:
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        tmp_path = f"{path}.tmp"
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(entries, f, indent=2)
+        os.replace(tmp_path, path)
+    except Exception as e:
+        print(f"[ingest-processor] WARN: Could not save folder-as-book mapping: {e}", flush=True)
+
+
+def get_folder_book_id(folder: str) -> int | None:
+    entry = _load_folder_books().get(os.path.normpath(folder))
+    return int(entry["book_id"]) if entry and "book_id" in entry else None
+
+
+def remember_folder_book(folder: str, book_id: int) -> None:
+    entries = _load_folder_books()
+    entries[os.path.normpath(folder)] = {"book_id": int(book_id), "updated": int(time.time())}
+    _save_folder_books(entries)
+
+
+def _get_cwa_usernames() -> set[str]:
+    try:
+        with sqlite3.connect(get_app_db_path(), timeout=30) as con:
+            return {str(row[0]).lower() for row in con.execute("SELECT name FROM user") if row[0]}
+    except Exception:
+        return set()
+
+
+def get_folder_book_dir(filepath: str, ingest_folder: str) -> str | None:
+    """The book folder a file belongs to in folder-as-book mode, or None.
+
+    Files directly in the ingest folder are single books. A first-level folder named
+    after a CWA user is an auto-send routing folder, not a book folder.
+    """
+    if not is_folder_as_book_enabled():
+        return None
+    ingest_folder = os.path.normpath(ingest_folder)
+    parent = os.path.normpath(os.path.dirname(filepath))
+    if parent == ingest_folder:
+        return None
+    try:
+        parts = os.path.relpath(parent, ingest_folder).split(os.sep)
+    except ValueError:
+        return None
+    if parts[0] == os.pardir:
+        return None
+    if len(parts) == 1 and parts[0].lower() in _get_cwa_usernames():
+        return None
+    return parent
+
+
+def wait_for_folder_to_settle(folder: str) -> None:
+    """Wait until no file in the folder changed for a few seconds, so all formats are there."""
+    try:
+        quiet = float(os.environ.get("CWA_INGEST_FOLDER_SETTLE_SECONDS", "5"))
+    except ValueError:
+        quiet = 5.0
+    deadline = time.time() + max(quiet * 12, 60)
+
+    def snapshot():
+        state = {}
+        for entry in os.scandir(folder):
+            if entry.is_file():
+                st = entry.stat()
+                state[entry.name] = (st.st_size, st.st_mtime)
+        return state
+
+    last = snapshot()
+    stable_since = time.time()
+    while time.time() < deadline:
+        time.sleep(min(1.0, max(quiet, 0.1)))
+        current = snapshot()
+        if current != last:
+            last, stable_since = current, time.time()
+        elif time.time() - stable_since >= quiet:
+            return
+    print(f"[ingest-processor] WARN: Folder {folder} kept changing, continuing anyway", flush=True)
+
+
+def pick_folder_main_file(files: list[str], target_format: str) -> str | None:
+    """Prefer the target format, then common ebook formats, then anything else."""
+    if not files:
+        return None
+    priority = [target_format] + [f for f in FOLDER_MAIN_FORMAT_PRIORITY if f != target_format]
+
+    def rank(path):
+        ext = Path(path).suffix[1:].lower()
+        return (priority.index(ext) if ext in priority else len(priority), os.path.basename(path).lower())
+
+    return min(files, key=rank)
+
+
 def _post_internal_endpoint(path: str, payload: dict | None = None) -> bool:
     global requests
     if requests is None:
@@ -566,6 +702,7 @@ class NewBookProcessor:
         # Current file
         self.filepath = filepath
         self.filename = os.path.basename(filepath)
+        self.folder_book_dir = get_folder_book_dir(filepath, self.ingest_folder)
         self.can_convert, self.input_format = self.can_convert_check()
         # Determine if the file is already in the desired target format using normalized extensions
         self.is_target_format = (self.input_format.lower() == str(self.target_format).lower())
@@ -982,6 +1119,11 @@ class NewBookProcessor:
             hook_book_ids = self.last_added_book_ids or ([self.last_added_book_id] if self.last_added_book_id is not None else [])
             self.run_post_import_hook_if_enabled(hook_book_ids)
 
+            # Folder-as-book: later files from this folder are attached to this book
+            folder_book_dir = getattr(self, "folder_book_dir", None)
+            if folder_book_dir and self.last_added_book_id is not None:
+                remember_folder_book(folder_book_dir, self.last_added_book_id)
+
             # Trigger auto-send for users who have it enabled
             if self.last_added_book_id is not None:
                 self.trigger_auto_send_if_enabled(book_id=self.last_added_book_id, book_path=book_path)
@@ -1052,6 +1194,24 @@ class NewBookProcessor:
         except Exception as e:
             print(f"[ingest-processor] ERROR: Failed to validate book_id {book_id}: {e}", flush=True)
             return False
+
+    def attach_folder_format(self, book_id: int) -> None:
+        """Folder-as-book: add this file as another format of book_id, unless it already has it"""
+        if self.input_format in self.get_book_formats(book_id):
+            print(f"[ingest-processor] Folder-as-book: book id {book_id} already has {self.input_format.upper()}, skipping {self.filename}", flush=True)
+            return
+        print(f"[ingest-processor] Folder-as-book: adding {self.filename} to book id {book_id}", flush=True)
+        self.add_format_to_book(book_id, self.filepath)
+
+    def get_book_formats(self, book_id: int) -> set[str]:
+        """Lower-case formats the book already has in the library"""
+        try:
+            with sqlite3.connect(self.metadata_db, timeout=30) as con:
+                rows = con.execute("SELECT format FROM data WHERE book = ?", (book_id,)).fetchall()
+            return {str(row[0]).lower() for row in rows if row[0]}
+        except Exception as e:
+            print(f"[ingest-processor] WARN: Could not read formats of book id {book_id}: {e}", flush=True)
+            return set()
 
     def add_format_to_book(self, book_id:int, book_path:str) -> None:
         """Attach a new format file to an existing Calibre book using calibredb add_format"""
@@ -1231,9 +1391,11 @@ class NewBookProcessor:
 
             # Subfolder routing: if the file was ingested from a subfolder,
             # only send to the user whose name matches that subfolder.
+            # In folder-as-book mode the book folder itself is not a user name.
             target_username = None
             try:
-                relative = os.path.relpath(self.filepath, self.ingest_folder)
+                routing_path = getattr(self, "folder_book_dir", None) or self.filepath
+                relative = os.path.relpath(routing_path, self.ingest_folder)
                 parts = relative.split(os.sep)
                 if len(parts) > 1:
                     target_username = parts[0]
@@ -1406,9 +1568,43 @@ class NewBookProcessor:
             print(f"[ingest-processor] An error occurred while attempting to recursively set ownership of {self.library_dir} to abc:abc. See the following error:\n{e}", flush=True)
 
 
-def main(filepath=None):
+def import_folder_as_book(nbp: NewBookProcessor) -> int:
+    """Import every file of nbp's book folder as one book: the best file first, the rest as formats."""
+    folder = nbp.folder_book_dir
+    print(f"[ingest-processor] Folder-as-book: collecting formats in {folder}", flush=True)
+    wait_for_folder_to_settle(folder)
+
+    ingestible = nbp.supported_book_formats | nbp.supported_audiobook_formats
+    files = sorted(
+        entry.path for entry in os.scandir(folder)
+        if entry.is_file()
+        and not entry.name.endswith((".cwa.json", ".cwa.failed.json"))
+        and Path(entry.name).suffix[1:].lower() in ingestible
+        and Path(entry.name).suffix[1:].lower() not in nbp.ingest_ignored_formats
+    )
+    main_file = pick_folder_main_file(files, nbp.target_format)
+    if main_file is None:
+        return 0
+
+    print(f"[ingest-processor] Folder-as-book: importing {os.path.basename(main_file)} as the book", flush=True)
+    exit_code = main(main_file, _folder_main=True) or 0
+    if get_folder_book_id(folder) is None:
+        # Without a book to attach to, import the remaining files on their own
+        print(f"[ingest-processor] WARN: Folder-as-book: no book was created for {folder}, importing the other files individually", flush=True)
+
+    for other in files:
+        if other != main_file and os.path.exists(other):
+            child_exit = main(other, _folder_main=get_folder_book_id(folder) is None)
+            if child_exit:
+                exit_code = int(child_exit)
+    return exit_code
+
+
+def main(filepath=None, _folder_main=False):
     """Checks if filepath is a directory. If it is, main will be ran on every file in the given directory
-    Inotifywait won't detect files inside folders if the folder was moved rather than copied"""
+    Inotifywait won't detect files inside folders if the folder was moved rather than copied
+
+    _folder_main: process the file on its own even in folder-as-book mode (used by import_folder_as_book)"""
 
     if filepath is None:
         if len(sys.argv) < 2:
@@ -1524,6 +1720,14 @@ def main(filepath=None):
             print(f"[ingest-processor] Skipping ignored/temporary file (no action taken): {nbp.filename}", flush=True)
             skip_delete = True
             return 0
+
+        # Folder-as-book: attach to the book this folder already produced, or import the folder as one book
+        if nbp.folder_book_dir and not _folder_main:
+            folder_book_id = get_folder_book_id(nbp.folder_book_dir)
+            if folder_book_id is not None and nbp._validate_book_exists(folder_book_id):
+                nbp.attach_folder_format(folder_book_id)
+                return 0
+            return import_folder_as_book(nbp)
 
         if nbp.is_target_format: # File can just be imported
             print(f"\n[ingest-processor]: No conversion needed for {nbp.filename}, importing now...", flush=True)

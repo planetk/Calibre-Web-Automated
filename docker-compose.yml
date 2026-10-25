@@ -29,6 +29,8 @@ services:
       # Optional timeout in seconds (default: 300)
       # - CWA_POST_IMPORT_HOOK=/config/hooks/post_import.sh
       # - CWA_POST_IMPORT_HOOK_TIMEOUT=300
+      # Treat all files in one subfolder of the ingest folder as formats of the same book (default: false)
+      # - CWA_INGEST_FOLDER_AS_BOOK=true
     volumes:
       # CW users migrating should stop their existing CW instance, make a copy of the config folder, and bind that here to carry over all of their user settings etc.
       - /path/to/config/folder:/config
