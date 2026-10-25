@@ -978,6 +978,10 @@ class NewBookProcessor:
             else:
                 self.fetch_metadata_if_enabled(staged_path.stem)
 
+            # Run the user's post-import hook before auto-send, so sent books carry its changes
+            hook_book_ids = self.last_added_book_ids or ([self.last_added_book_id] if self.last_added_book_id is not None else [])
+            self.run_post_import_hook_if_enabled(hook_book_ids)
+
             # Trigger auto-send for users who have it enabled
             if self.last_added_book_id is not None:
                 self.trigger_auto_send_if_enabled(book_id=self.last_added_book_id, book_path=book_path)
@@ -1138,6 +1142,52 @@ class NewBookProcessor:
 
         except Exception as e:
             print(f"[ingest-processor] Error fetching metadata: {e}", flush=True)
+
+
+    def run_post_import_hook_if_enabled(self, book_ids: list[int]) -> None:
+        """Run the executable named in CWA_POST_IMPORT_HOOK for newly imported books.
+
+        The hook gets the book ids as arguments and CWA_BOOK_IDS, CWA_LIBRARY_DIR and
+        CWA_METADATA_DB in its environment. A failing hook is logged, never fatal.
+        """
+        hook = os.environ.get("CWA_POST_IMPORT_HOOK", "").strip()
+        if not hook:
+            return
+        if not book_ids:
+            print("[ingest-processor] WARN: No book id known for this import, skipping post-import hook", flush=True)
+            return
+        if not os.access(hook, os.X_OK):
+            print(f"[ingest-processor] WARN: Post-import hook {hook} is missing or not executable, skipping", flush=True)
+            return
+
+        try:
+            timeout = int(os.environ.get("CWA_POST_IMPORT_HOOK_TIMEOUT", "300"))
+        except ValueError:
+            timeout = 300
+
+        ids = [str(book_id) for book_id in book_ids]
+        hook_env = self.calibre_env.copy()
+        hook_env["CWA_BOOK_IDS"] = ",".join(ids)
+        hook_env["CWA_LIBRARY_DIR"] = self.library_dir
+        hook_env["CWA_METADATA_DB"] = self.metadata_db
+
+        print(f"[ingest-processor] Running post-import hook for book id(s) {', '.join(ids)}", flush=True)
+        try:
+            result = subprocess.run([hook, *ids], env=hook_env, capture_output=True, text=True, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            print(f"[ingest-processor] WARN: Post-import hook timed out after {timeout}s", flush=True)
+            return
+        except Exception as e:
+            print(f"[ingest-processor] WARN: Post-import hook could not be run: {e}", flush=True)
+            return
+
+        output = "\n".join(part.strip() for part in (result.stdout, result.stderr) if part and part.strip())
+        if output:
+            print(f"[ingest-processor] Post-import hook output:\n{output}", flush=True)
+        if result.returncode != 0:
+            print(f"[ingest-processor] WARN: Post-import hook exited with code {result.returncode}", flush=True)
+        else:
+            print("[ingest-processor] Post-import hook completed", flush=True)
 
 
     def trigger_auto_send_if_enabled(self, book_title: str | None = None, book_path: str | None = None, book_id: int | None = None) -> None:

@@ -25,6 +25,10 @@ services:
       # Skip the automatic library detection/mount at startup. When enabled, the auto-library service will not run.
       # Accepts: true/yes/1 to disable auto-mount (default: false)
       # - DISABLE_LIBRARY_AUTOMOUNT=false
+      # Executable run after each ingested book, before auto-send. Receives the book id(s) as arguments.
+      # Optional timeout in seconds (default: 300)
+      # - CWA_POST_IMPORT_HOOK=/config/hooks/post_import.sh
+      # - CWA_POST_IMPORT_HOOK_TIMEOUT=300
     volumes:
       # CW users migrating should stop their existing CW instance, make a copy of the config folder, and bind that here to carry over all of their user settings etc.
       - /path/to/config/folder:/config

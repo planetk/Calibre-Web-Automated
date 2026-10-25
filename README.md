@@ -111,6 +111,17 @@ This tells CWA to avoid enabling WAL on the Calibre `metadata.db` and the `app.d
 - On Docker Desktop (Windows/macOS), the container runs on a LinuxKit/WSL2 VM and host-mounted paths may not propagate `inotify` events reliably. CWA auto-detects Docker Desktop at startup and prefers the same polling watcher for reliability.
 - Advanced: You can also force polling regardless of share mode by setting `CWA_WATCH_MODE=poll`.
 
+### Post-import hook
+
+- Set `CWA_POST_IMPORT_HOOK` to an executable inside the container (e.g. `/config/hooks/post_import.sh`) to run your own processing on every newly ingested book.
+- It runs as the `abc` user after the import and the optional metadata fetch, and before auto-send, so books sent automatically already carry its changes.
+- The hook receives the Calibre book id(s) as arguments and these environment variables:
+  - `CWA_BOOK_IDS` – comma-separated book ids
+  - `CWA_LIBRARY_DIR` – the Calibre library directory
+  - `CWA_METADATA_DB` – path to `metadata.db`
+- Ingest runs one book at a time, so the hook never overlaps with another import. Keep it short: it is stopped after `CWA_POST_IMPORT_HOOK_TIMEOUT` seconds (default `300`).
+- A failing or missing hook is logged and never aborts the import.
+
 ### Running behind multiple proxies (Cloudflare Tunnel, reverse proxy)
 
 - CWA uses Werkzeug's ProxyFix middleware to properly handle `X-Forwarded-For`, `X-Forwarded-Proto`, and other proxy headers.
